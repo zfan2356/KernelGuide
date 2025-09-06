@@ -6,9 +6,9 @@
 
 #include "../utils/exception.hpp"
 
-namespace deep_gemm {
+namespace kernels {
 
-#if CUDART_VERSION >= 12080 and defined(DG_JIT_USE_RUNTIME_API)
+#if CUDART_VERSION >= 12080 and defined(K_JIT_USE_RUNTIME_API)
 
 // Use CUDA runtime API
 using LibraryHandle = cudaLibrary_t;
@@ -81,8 +81,8 @@ static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const s
                                 LibraryHandle* library_opt = nullptr) {
     LibraryHandle library;
     KernelHandle kernel;
-    DG_CUDA_DRIVER_CHECK(cuModuleLoad(&library, cubin_path.c_str()));
-    DG_CUDA_DRIVER_CHECK(cuModuleGetFunction(&kernel, library, func_name.c_str()));
+    K_CUDA_DRIVER_CHECK(cuModuleLoad(&library, cubin_path.c_str()));
+    K_CUDA_DRIVER_CHECK(cuModuleGetFunction(&kernel, library, func_name.c_str()));
 
     if (library_opt != nullptr)
         *library_opt = library;
@@ -91,14 +91,14 @@ static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const s
 
 static void unload_library(const LibraryHandle& library) {
     const auto& error = cuModuleUnload(library);
-    DG_HOST_ASSERT(error == CUDA_SUCCESS or error == CUDA_ERROR_DEINITIALIZED);
+    K_HOST_ASSERT(error == CUDA_SUCCESS or error == CUDA_ERROR_DEINITIALIZED);
 }
 
 static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel, const cudaStream_t& stream,
                                                   const int& smem_size, const dim3& grid_dim, const dim3& block_dim,
                                                   const int& cluster_dim) {
     if (smem_size > 0)
-        DG_CUDA_DRIVER_CHECK(cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
+        K_CUDA_DRIVER_CHECK(cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
 
     LaunchConfigHandle config;
     config.gridDimX = grid_dim.x;
@@ -133,4 +133,4 @@ static auto launch_kernel(const KernelHandle& kernel, const LaunchConfigHandle& 
 
 #endif
 
-} // namespace deep_gemm
+} // namespace kernels

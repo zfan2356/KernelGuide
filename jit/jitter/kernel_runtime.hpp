@@ -6,7 +6,7 @@
 #include "device_runtime.hpp"
 #include "handle.hpp"
 
-namespace deep_gemm {
+namespace kernels {
 
 struct LaunchArgs {
     std::pair<int, int> grid_dim;
@@ -31,7 +31,7 @@ public:
 
     explicit KernelRuntime(const std::filesystem::path& dir_path) {
         // Check `prepare_init`
-        DG_HOST_ASSERT(not cuda_home.empty());
+        K_HOST_ASSERT(not cuda_home.empty());
 
         // NOLINT(*-pro-type-member-init)
         const auto& cuobjdump_path = cuda_home / "bin" / "cuobjdump";
@@ -45,7 +45,7 @@ public:
                                                         "__assertfail"};
         const auto& [exit_code, symbols] =
             call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
-        DG_HOST_ASSERT(exit_code == 0);
+        K_HOST_ASSERT(exit_code == 0);
         std::istringstream iss(symbols);
         std::vector<std::string> symbol_names;
         for (std::string line; std::getline(iss, line);) {
@@ -64,7 +64,7 @@ public:
         }
 
         // Load from the library
-        DG_HOST_ASSERT(symbol_names.size() == 1);
+        K_HOST_ASSERT(symbol_names.size() == 1);
         kernel = load_kernel(cubin_path, symbol_names[0], &library);
     }
 
@@ -81,7 +81,7 @@ public:
     }
 };
 
-DG_DECLARE_STATIC_VAR_IN_CLASS(KernelRuntime, cuda_home);
+K_DECLARE_STATIC_VAR_IN_CLASS(KernelRuntime, cuda_home);
 
 template <typename Derived> class LaunchRuntime {
 public:
@@ -114,4 +114,4 @@ public:
     }
 };
 
-} // namespace deep_gemm
+} // namespace kernels
