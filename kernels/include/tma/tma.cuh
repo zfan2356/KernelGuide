@@ -5,34 +5,28 @@
 #include <cuda_bf16.h>
 #include "prototype.cuh"
 
+#include <cutlass/arch/barrier.h>
+
 namespace kernels::tma {
 using namespace kernels::prototype;
 using bf16_2 = __nv_bfloat162;
 using bf16 = __nv_bfloat16;
-
-template <bool IsConsumer, uint32_t NumConsumers> class GetRank {
-    __device__ __forceinline__ uint32_t operator()() {
-        uint32_t warp_id = runtime::warpid();
-        if constexpr (IsConsumer) {
-            return warp_id;
-        } else {
-            return warp_id - NumConsumers;
-        }
-    }
-};
+using Barrier = cutlass::arch::ClusterTransactionBarrier;
+// TODO: has some bugs
+// using Barrier = sync::Semaphore;
 
 template <uint32_t NumWorkers, uint32_t M, uint32_t N, uint32_t BlockM, uint32_t BlockN, uint32_t NumBlocks,
-          uint32_t NumStages, class GetRank>
+          uint32_t NumStages>
 struct Scheduler {
     constexpr static auto NumWarps = NumWorkers * NumBlocks;
 
-    explicit __device__ Scheduler() {
+    explicit __device__ Scheduler(uint32_t initial_rank) {
         num_m_blocks = utils::ceil_div(M, BlockM);
         num_n_blocks = utils::ceil_div(N, BlockN);
         num_blocks = num_m_blocks * num_n_blocks;
-        current_block = blockIdx.x * NumWorkers + GetRank()();
+        current_block = blockIdx.x * NumWorkers + initial_rank;
         current_iter = 0;
-        stage_id = GetRank()();
+        stage_id = initial_rank;
     }
     __device__ __forceinline__ bool current_work_tile(uint32_t& m_idx, uint32_t& n_idx) const {
         if (current_block >= num_blocks) {
@@ -55,7 +49,7 @@ struct Scheduler {
 
 template <uint32_t NumBlocks, uint32_t NumWarpsPerBlock, uint32_t NumConsumers, uint32_t NumProducers,
           uint32_t NumStages, uint32_t M, uint32_t N, uint32_t BlockM, uint32_t BlockN>
-__global__ __launch_bounds__(NumWarpsPerBlock * 32, 1) void tma_impl(__nv_bfloat16* x, __nv_bfloat16* out) {
+__global__ __launch_bounds__(NumWarpsPerBlock * 32, 1) void tma_impl(bf16* x, bf16* out) {
     /*
     x: [M, N] bfloat16
     out: [M, N] bfloat16
@@ -70,35 +64,37 @@ __global__ __launch_bounds__(NumWarpsPerBlock * 32, 1) void tma_impl(__nv_bfloat
     we will use tma async load/store to implement producer-consumer pattern, use warp-specialize
     */
     constexpr static uint32_t NumWarps = NumWarpsPerBlock * NumBlocks;
+    static_assert(NumConsumers + NumProducers == NumWarpsPerBlock);
 
     // first, we need init a multi-stage shared memory
     // we use __nv_bfloat162 to utilize the 32-bit register
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
-    auto smem_d = reinterpret_cast<__nv_bfloat16*>(smem_buffer);
+    constexpr static auto SMEM_SIZE = BlockM * BlockN * sizeof(bf16);
+    static_assert(SMEM_SIZE % 1024 == 0, "SMEM_SIZE must be aligned to 1024");
 
     bf16* smem_x[NumStages];
     bf16* smem_y[NumStages];
-    sync::Semaphore* empty_barrier[NumStages];
-    sync::Semaphore* full_barrier[NumStages];
-    constexpr static auto SMEM_SIZE = BlockM * BlockN;
+    Barrier* empty_barrier[NumStages];
+    Barrier* full_barrier[NumStages];
 
 #pragma unroll
     for (int i = 0; i < NumStages; i++) {
-        smem_x[i] = reinterpret_cast<__nv_bfloat16*>(smem_buffer + i * SMEM_SIZE);
-        smem_y[i] = reinterpret_cast<__nv_bfloat16*>(smem_buffer + NumStages * SMEM_SIZE + i * SMEM_SIZE);
+        smem_x[i] = reinterpret_cast<bf16*>(smem_buffer + i * SMEM_SIZE);
+        smem_y[i] = reinterpret_cast<bf16*>(smem_buffer + NumStages * SMEM_SIZE + i * SMEM_SIZE);
     }
-    auto barrier_ptr = reinterpret_cast<sync::Semaphore*>(smem_buffer + NumStages * SMEM_SIZE * 2);
+
+    auto barrier_ptr = reinterpret_cast<Barrier*>(smem_buffer + NumStages * SMEM_SIZE * 2);
 #pragma unroll
     for (int i = 0; i < NumStages; i++) {
-        empty_barrier[i] = barrier_ptr + i;
-        full_barrier[i] = barrier_ptr + NumStages + i;
+        full_barrier[i] = barrier_ptr + i;
+        empty_barrier[i] = barrier_ptr + NumStages + i;
     }
 
     if (threadIdx.x == NumConsumers * 32) {
 #pragma unroll
         for (int i = 0; i < NumStages; i++) {
-            full_barrier[i]->init(0, 1);
-            empty_barrier[i]->init(NumConsumers, 0);
+            full_barrier[i]->init(1);
+            empty_barrier[i]->init(NumConsumers);
         }
         asm volatile("fence.proxy.async.shared::cta; \n" ::);
         asm volatile("fence.mbarrier_init.release.cluster; \n" ::);
@@ -130,12 +126,13 @@ __global__ __launch_bounds__(NumWarpsPerBlock * 32, 1) void tma_impl(__nv_bfloat
         }
     } regs;
 
-    uint32_t warp_id = runtime::warpid();
 
+    uint32_t warp_id = runtime::warpid();
     if (warp_id >= NumConsumers) {
-        // consumer
-        Scheduler<NumConsumers, M, N, BlockM, BlockN, NumBlocks, NumStages, GetRank<true, NumConsumers>> scheduler;
+        // producer
+        Scheduler<NumProducers, M, N, BlockM, BlockN, NumBlocks, NumStages> scheduler(warp_id - NumConsumers);
         uint32_t m_idx, n_idx;
+        using producer = runtime::Group<NumConsumers, NumWarpsPerBlock>;
         while (scheduler.current_work_tile(m_idx, n_idx)) {
             empty_barrier[scheduler.stage_id]->wait((scheduler.current_iter + 1) & 1);
             // now we should load block_m  * block_n data to shared memory which used by tma
@@ -147,26 +144,44 @@ __global__ __launch_bounds__(NumWarpsPerBlock * 32, 1) void tma_impl(__nv_bfloat
             // in the code, we explore the difference between using one thread and use all threads which is same as
             // cp.async
 
+            // if (producer::laneid() == 0) {
+            //     printf("producer: %d, %d\n", m_idx, n_idx);
+            // }
+
             auto launch_tma_use_one_thread = [&]() {
-                // there are two producers. and we use the elected one thread of the producer warpgroup to issue the tma
-                // instructions
+                // there are two producers. and we use the elected one thread of the producer warpgroup to issue the
+                // tma instructions
+                auto smem_x_ptr = smem_x[scheduler.stage_id];
+                auto gmem_x_ptr = x + (m_idx * BlockM) * N + n_idx * BlockN;
+                auto barrier_ptr = reinterpret_cast<uint64_t*>(&full_barrier[scheduler.stage_id]);
                 for (uint32_t i = 0; i < BlockM; i++) {
-                    async::TMA::load<1>(smem_x[scheduler.stage_id] + i * BlockN,
-                                        x + (m_idx * BlockM + i) * N + (n_idx * BlockN), BlockN * sizeof(bf16),
-                                        full_barrier[scheduler.stage_id]);
+                    async::TMA::load<1>(smem_x_ptr, gmem_x_ptr, BlockN * sizeof(bf16), barrier_ptr);
+                    smem_x_ptr += BlockN;
+                    gmem_x_ptr += N;
                 }
             };
-            full_barrier[scheduler.stage_id]->arrive_and_expect(BlockM * BlockN * sizeof(bf16));
+            if (producer::laneid() == 0) {
+                launch_tma_use_one_thread();
+                full_barrier[scheduler.stage_id]->arrive_and_expect_tx(BlockM * BlockN * sizeof(bf16));
+            }
+            // if (producer::laneid() == 0) {
+            // full_barrier[scheduler.stage_id]->arrive();
+            // }
+
             scheduler.step();
         }
     } else {
-        // producer
-        Scheduler<NumProducers, M, N, BlockM, BlockN, NumBlocks, NumStages, GetRank<false, NumProducers>> scheduler;
+        // consumer
+        Scheduler<NumConsumers, M, N, BlockM, BlockN, NumBlocks, NumStages> scheduler(warp_id);
         using consumer = runtime::Group<0, NumConsumers>;
         uint32_t m_idx, n_idx;
         while (scheduler.current_work_tile(m_idx, n_idx)) {
             full_barrier[scheduler.stage_id]->wait(scheduler.current_iter & 1);
             // we will compute the data in shared memory
+
+            // if (consumer::laneid() == 0) {
+            //     printf("consumer: %d, %d\n", m_idx, n_idx);
+            // }
 
             // because NumElemPerThread is 4 bf16_2, so we need to load 2 plus bf16 per thread
             for (int i = runtime::laneid() * NumElemPerThread * 2; i < BlockM * BlockN;
@@ -178,8 +193,9 @@ __global__ __launch_bounds__(NumWarpsPerBlock * 32, 1) void tma_impl(__nv_bfloat
                 regs.store(out, glo_offs);
             }
             if (runtime::elect_one_sync()) {
-                empty_barrier[scheduler.stage_id]->arrive(1);
+                empty_barrier[scheduler.stage_id]->arrive();
             }
+            scheduler.step();
         }
     }
 }

@@ -72,29 +72,23 @@ struct MBarrier {
 
 // a warp level semaphore, use one thread to init
 struct Semaphore {
-    __device__ __forceinline__ void init(uint32_t thread_count, uint32_t transaction_count) {
-        Semaphore::init(&this->value, thread_count, transaction_count);
+    __device__ __forceinline__ void init(uint32_t count) {
+        Semaphore::init(&this->value, count);
     }
-    __device__ __forceinline__ static void init(const ValueType* smem, uint32_t thread_count,
-                                                uint32_t transaction_count) {
-        if (runtime::elect_one_sync()) {
-            uint32_t sem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+    __device__ __forceinline__ static void init(const ValueType* smem, uint32_t count) {
+        uint32_t sem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
 
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(sem_ptr),
-                         "r"(thread_count + transaction_count));
-        }
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(sem_ptr), "r"(count));
     }
     __device__ __forceinline__ static void destroy(const ValueType* smem) {
-        if (runtime::elect_one_sync()) {
-            uint32_t sem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+        uint32_t sem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
 
-            asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" ::"r"(sem_ptr));
-        }
+        asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" ::"r"(sem_ptr));
     }
     __device__ __forceinline__ void wait(uint32_t phase) {
         MBarrier::wait(&this->value, phase);
     }
-    __device__ __forceinline__ void arrive(uint32_t count) {
+    __device__ __forceinline__ void arrive(uint32_t count = 1) {
         MBarrier::arrive(&this->value, count);
     }
     __device__ __forceinline__ void arrive_and_expect(uint32_t bytes) {
